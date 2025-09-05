@@ -1,120 +1,230 @@
-# make_network_zip.py
-# usage:
-#   python make_network_zip.py "network_data (1).xlsx"
-
-import sys, os, json, zipfile, hashlib
-from typing import List
+import os
+import json
+import re
 import pandas as pd
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import google.generativeai as genai
+from pathlib import Path
 
-def clean_phone(val: object) -> str:
-    s = str(val).strip()
-    if s.lower() in ("nan", "none", "null"):
-        return ""
-    if s.endswith(".0"):  # أرقام اتقريت float من الإكسل
-        s = s[:-2]
-    return s
+# --- 1. الإعدادات الأولية ---
 
-def main(xlsx_path: str):
-    if not os.path.exists(xlsx_path):
-        print(f"[!] Excel not found: {xlsx_path}")
-        sys.exit(1)
+# تهيئة تطبيق فلاسك
+app = Flask(__name__, static_folder='.', static_url_path='')
+CORS(app) # السماح بالطلبات من مصادر مختلفة (CORS)
 
-    # قراءة الشيت
-    xlsx = pd.ExcelFile(xlsx_path)
-    sheet_name = "network_data" if "network_data" in xlsx.sheet_names else xlsx.sheet_names[0]
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=0)
-    df.columns = [str(c).strip() for c in df.columns]
+# إعداد مفتاح Gemini API
+# هام: يجب تعيين متغير بيئة باسم "GEMINI_API_KEY" يحتوي على مفتاحك
+try:
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        raise ValueError("لم يتم العثور على مفتاح GEMINI_API_KEY في متغيرات البيئة.")
+    genai.configure(api_key=GEMINI_API_KEY)
+except Exception as e:
+    print(f"خطأ في إعداد Gemini API: {e}")
+    # يمكنك إيقاف التطبيق هنا إذا كان المفتاح ضرورياً للتشغيل
+    # exit(1)
 
-    # تحديد أعمدة مطلوبة (أسماء عربية كما في الملف)
-    name_col = "اسم مقدم الخدمة" if "اسم مقدم الخدمة" in df.columns else ("مقدم الخدمة" if "مقدم الخدمة" in df.columns else None)
-    if name_col is None:
-        print("[!] لم يتم العثور على عمود الاسم (اسم مقدم الخدمة/مقدم الخدمة).")
-        sys.exit(1)
+# --- 2. تحميل ومعالجة البيانات ---
 
-    required_source_cols = {
-        "المنطقة": "governorate",
-        "التخصص الرئيسي": "provider_type",
-        "التخصص الفرعي": "specialty_sub",
-        name_col: "name",
-        "عنوان مقدم الخدمة": "address",
-    }
+NETWORK_DF = pd.DataFrame()
+UNIQUE_SPECIALTIES = []
 
-    # تأكد من وجود الأعمدة، لو ناقص أنشئ عمود فاضي
-    for col in list(required_source_cols.keys()) + ["Telephone1","Telephone2","Telephone3","Telephone4","Hotline"]:
-        if col not in df.columns:
-            df[col] = ""
+def load_network_data():
+    """تحميل بيانات الشبكة الطبية من ملف JSON إلى DataFrame عند بدء التشغيل"""
+    global NETWORK_DF, UNIQUE_SPECIALTIES
+    json_path = Path("network_data.json")
+    if json_path.exists():
+        try:
+            print(f"[*] يتم تحميل بيانات الشبكة من {json_path}...")
+            NETWORK_DF = pd.read_json(json_path)
+            # استخراج التخصصات الفريدة لاستخدامها في توجيه النموذج
+            specialties = pd.concat([NETWORK_DF['provider_type'], NETWORK_DF['specialty_sub']]).dropna().unique()
+            UNIQUE_SPECIALTIES = [s for s in specialties if s and "جميع" not in s]
+            print(f"[✓] تم تحميل {len(NETWORK_DF)} سجل بنجاح.")
+            # print(f"[*] التخصصات المتاحة: {UNIQUE_SPECIALTIES}")
+        except Exception as e:
+            print(f"[!] خطأ أثناء تحميل أو معالجة {json_path}: {e}")
+    else:
+        print(f"[!] تحذير: ملف البيانات {json_path} غير موجود. خاصية البحث لن تعمل.")
 
-    # تخلّص من الصفوف الفارغة
-    df = df.dropna(how="all")
+# --- 3. نماذج الذكاء الاصطناعي ---
 
-    # احتفظ فقط بالصفوف التي تحتوي منطقة واسم
-    df = df[(df["المنطقة"].astype(str).str.strip() != "") & (df[name_col].astype(str).str.strip() != "")]
+# إعداد نماذج Gemini
+# ملاحظة: يتم تهيئة النماذج عند أول استخدام لتجنب الأخطاء إذا لم يتم توفير المفتاح
+text_model = None
+vision_model = None
 
-    records = []
-    for idx, row in df.iterrows():
-        phones: List[str] = []
-        for c in ["Telephone1","Telephone2","Telephone3","Telephone4"]:
-            p = clean_phone(row.get(c, ""))
-            if p not in ("", "0"):
-                phones.append(p)
+def get_text_model():
+    global text_model
+    if text_model is None:
+        text_model = genai.GenerativeModel('gemini-1.5-flash')
+    return text_model
 
-        hotline = clean_phone(row.get("Hotline", ""))
-        hotline = hotline if hotline not in ("", "0") else None
+def get_vision_model():
+    global vision_model
+    if vision_model is None:
+        vision_model = genai.GenerativeModel('gemini-1.5-flash')
+    return vision_model
+    
+def clean_json_response(text):
+    """محاولة تنظيف استجابة النموذج لاستخراج JSON صالح"""
+    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if match:
+        return match.group(1)
+    # إذا لم يجد النمط أعلاه، يبحث عن أول '{' وآخر '}'
+    try:
+        start = text.index('{')
+        end = text.rindex('}') + 1
+        return text[start:end]
+    except ValueError:
+        return None
 
-        rec = {
-            "governorate": str(row.get("المنطقة", "")).strip(),
-            "provider_type": str(row.get("التخصص الرئيسي", "")).strip(),
-            "specialty_sub": str(row.get("التخصص الفرعي", "")).strip(),
-            "name": str(row.get(name_col, "")).strip(),
-            "address": str(row.get("عنوان مقدم الخدمة", "")).strip(),
-            "phones": phones,
-            "hotline": hotline,
-            "id": f"row-{idx}",
-        }
-        records.append(rec)
+# --- 4. الواجهات البرمجية (API Endpoints) ---
 
-    # مسارات الإخراج
-    out_json = "network_data.json"
-    out_json_min = "network_data.min.json"
-    out_csv = "network_data.csv"
-    out_zip = "network_data_all.zip"
+@app.route('/')
+def index():
+    """عرض ملف الواجهة الأمامية الرئيسي"""
+    return send_from_directory('.', 'index.html')
 
-    # JSON منسّق
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+@app.route('/api/symptoms-search', methods=['POST'])
+def symptoms_search():
+    """API لتحليل الأعراض والموقع وإرجاع مقدمي الخدمة المناسبين"""
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
 
-    # JSON مضغوط (minified)
-    with open(out_json_min, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, separators=(",", ":"))
+    data = request.get_json()
+    if not data or 'symptoms' not in data or 'location' not in data:
+        return jsonify({"error": "البيانات المرسلة غير كاملة."}), 400
 
-    # CSV (phones كقائمة مفصولة بفواصل منقوطة)
-    df_out = pd.DataFrame(records)
-    df_out["phones"] = df_out["phones"].apply(lambda lst: ";".join(lst) if isinstance(lst, list) else "")
-    df_out.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    symptoms = data['symptoms']
+    location = data['location']
 
-    # ZIP
-    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.write(out_json, arcname=os.path.basename(out_json))
-        z.write(out_json_min, arcname=os.path.basename(out_json_min))
-        z.write(out_csv, arcname=os.path.basename(out_csv))
+    if NETWORK_DF.empty:
+        return jsonify({"error": "قاعدة بيانات الشبكة الطبية غير متاحة."}), 500
 
-    # شوية معلومات للطباعة
-    def md5sum(path):
-        m = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                m.update(chunk)
-        return m.hexdigest()
+    try:
+        # بناء الطلب (Prompt) للنموذج
+        prompt = f"""
+        أنت مساعد طبي متخصص في توجيه المرضى. بناءً على الأعراض التالية: "{symptoms}"، قم بتحديد التخصص الطبي الأنسب.
+        يجب أن تختار تخصصًا واحدًا فقط من القائمة التالية: {json.dumps(UNIQUE_SPECIALTIES, ensure_ascii=False)}.
+        وقدم نصيحة أولية قصيرة جداً (جملة واحدة) باللغة العربية.
 
-    print("\n[✓] Conversion complete")
-    print(f"  Records: {len(records)}")
-    print(f"  JSON: {out_json}   ({os.path.getsize(out_json)} bytes)   md5={md5sum(out_json)}")
-    print(f"  JSON(min): {out_json_min}   ({os.path.getsize(out_json_min)} bytes)   md5={md5sum(out_json_min)}")
-    print(f"  CSV:  {out_csv}   ({os.path.getsize(out_csv)} bytes)   md5={md5sum(out_csv)}")
-    print(f"  ZIP:  {out_zip}   ({os.path.getsize(out_zip)} bytes)   md5={md5sum(out_zip)}")
+        أريد الإجابة بصيغة JSON فقط، بالشكل التالي ولا شيء غيره:
+        {{
+          "recommended_specialty": "التخصص المختار من القائمة",
+          "initial_advice": "نصيحة أولية موجزة."
+        }}
+        """
+        
+        model = get_text_model()
+        response = model.generate_content(prompt)
+        
+        # تنظيف وتحليل استجابة النموذج
+        cleaned_response_text = clean_json_response(response.text)
+        if not cleaned_response_text:
+             raise Exception("لم يتمكن النموذج من إرجاع JSON صالح.")
+        
+        ai_result = json.loads(cleaned_response_text)
+        recommended_specialty = ai_result.get("recommended_specialty", "")
+        initial_advice = ai_result.get("initial_advice", "")
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python make_network_zip.py \"network_data (1).xlsx\"")
-        sys.exit(1)
-    main(sys.argv[1])
+        # البحث في DataFrame بناءً على توصية النموذج والموقع
+        # 1. فلترة حسب الموقع (بحث مرن)
+        location_df = NETWORK_DF[
+            NETWORK_DF['governorate'].str.contains(location, case=False, na=False) |
+            NETWORK_DF['address'].str.contains(location, case=False, na=False)
+        ]
+
+        # 2. فلترة حسب التخصص الموصى به
+        best_match_df = location_df[
+            location_df['provider_type'].str.contains(recommended_specialty, case=False, na=False) |
+            location_df['specialty_sub'].str.contains(recommended_specialty, case=False, na=False)
+        ]
+
+        # 3. تحديد أفضل نتيجة والباقي
+        if not best_match_df.empty:
+            best_match = best_match_df.head(1).to_dict(orient='records')
+            other_results = best_match_df.iloc[1:].to_dict(orient='records')
+        else:
+            # إذا لم يتم العثور على تطابق للتخصص، يتم إرجاع نتائج الموقع فقط
+            best_match = location_df.head(1).to_dict(orient='records')
+            other_results = location_df.iloc[1:].to_dict(orient='records')
+
+        return jsonify({
+            "initial_advice": initial_advice,
+            "best_match": best_match,
+            "other_results": other_results
+        })
+
+    except Exception as e:
+        print(f"خطأ في API البحث بالأعراض: {e}")
+        return jsonify({"error": f"حدث خطأ أثناء معالجة طلبك: {e}"}), 500
+
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_reports():
+    """API لتحليل التقارير الطبية المرفوعة"""
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
+        
+    data = request.get_json()
+    if not data or 'files' not in data or not isinstance(data['files'], list):
+        return jsonify({"error": "البيانات المرسلة غير صالحة أو لا تحتوي على ملفات."}), 400
+
+    try:
+        model_parts = []
+        
+        # بناء الطلب (Prompt)
+        prompt = f"""
+        أنت مساعد طبي ذكي متخصص في تحليل التقارير الطبية. قم بتحليل الصور أو ملفات PDF المرفقة.
+        مهمتك هي تقديم شرح مبسط، نصائح مؤقتة، والتخصص الموصى به.
+        
+        أريد الإجابة باللغة العربية وبصيغة JSON فقط، بالشكل التالي ولا شيء غيره:
+        {{
+          "interpretation": "شرح مبسط وواضح لنتائج التقرير.",
+          "temporary_advice": [
+            "نصيحة أولى على شكل جملة.",
+            "نصيحة ثانية على شكل جملة.",
+            "نصيحة ثالثة على شكل جملة."
+          ],
+          "recommended_specialty": "اسم التخصص الطبي الوحيد الذي يجب على المريض زيارته."
+        }}
+        
+        تذكر: لا تقدم أي نص قبل أو بعد كائن الـ JSON.
+        """
+        model_parts.append(prompt)
+
+        # معالجة الملفات المرفوعة
+        for file_info in data['files']:
+            mime_type = file_info.get('mime_type')
+            base64_data = file_info.get('data')
+            if mime_type and base64_data:
+                model_parts.append({'mime_type': mime_type, 'data': base64_data})
+
+        if len(model_parts) < 2: # يجب أن يكون هناك طلب + ملف واحد على الأقل
+             return jsonify({"error": "لم يتم إرسال أي ملفات صالحة للتحليل."}), 400
+
+        # إرسال الطلب إلى النموذج
+        model = get_vision_model()
+        response = model.generate_content(model_parts)
+        
+        # تنظيف وتحليل الاستجابة
+        cleaned_response_text = clean_json_response(response.text)
+        if not cleaned_response_text:
+            raise Exception("لم يتمكن النموذج من إرجاع JSON صالح.")
+            
+        ai_result = json.loads(cleaned_response_text)
+
+        return jsonify(ai_result)
+
+    except Exception as e:
+        print(f"خطأ في API تحليل التقارير: {e}")
+        return jsonify({"error": f"حدث خطأ أثناء تحليل التقرير: {e}"}), 500
+
+# --- 5. تشغيل التطبيق ---
+
+if __name__ == '__main__':
+    load_network_data() # تحميل البيانات عند بدء التشغيل
+    # عند التشغيل المحلي، استخدم المنفذ 5000
+    app.run(debug=True, port=5000)
