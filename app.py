@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import pandas as pd
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import google.generativeai as genai
@@ -9,15 +8,12 @@ from pathlib import Path
 
 # --- 1. الإعدادات الأولية ---
 
-# تعديل هام: تحديد المجلد الذي يحتوي على ملفات الواجهة الأمامية (HTML, CSS, JS)
-# افترضت أن اسمه 'public'. إذا كان اسم المجلد مختلفًا، قم بتغييره هنا.
-STATIC_DIR = 'public'
-
-# تهيئة تطبيق فلاسك مع تحديد المجلد الصحيح
-app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='')
-CORS(app)
+# تهيئة تطبيق فلاسك ليخدم الملفات من المجلد الحالي
+app = Flask(__name__, static_folder='.', static_url_path='')
+CORS(app) # السماح بالطلبات من مصادر مختلفة (CORS)
 
 # إعداد مفتاح Gemini API
+# هام: يجب تعيين متغير بيئة باسم "GEMINI_API_KEY" يحتوي على مفتاحك
 try:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
@@ -26,29 +22,7 @@ try:
 except Exception as e:
     print(f"خطأ في إعداد Gemini API: {e}")
 
-# --- 2. تحميل ومعالجة البيانات ---
-
-NETWORK_DF = pd.DataFrame()
-UNIQUE_SPECIALTIES = []
-
-def load_network_data():
-    """تحميل بيانات الشبكة الطبية من ملف JSON إلى DataFrame عند بدء التشغيل"""
-    global NETWORK_DF, UNIQUE_SPECIALTIES
-    # تأكد من أن المسار صحيح بالنسبة لمكان تشغيل Gunicorn
-    json_path = Path(__file__).parent / "network_data.json"
-    if json_path.exists():
-        try:
-            print(f"[*] يتم تحميل بيانات الشبكة من {json_path}...")
-            NETWORK_DF = pd.read_json(json_path)
-            specialties = pd.concat([NETWORK_DF['provider_type'], NETWORK_DF['specialty_sub']]).dropna().unique()
-            UNIQUE_SPECIALTIES = [s for s in specialties if s and "جميع" not in s]
-            print(f"[✓] تم تحميل {len(NETWORK_DF)} سجل بنجاح.")
-        except Exception as e:
-            print(f"[!] خطأ أثناء تحميل أو معالجة {json_path}: {e}")
-    else:
-        print(f"[!] تحذير: ملف البيانات {json_path} غير موجود. خاصية البحث لن تعمل.")
-
-# --- 3. نماذج الذكاء الاصطناعي ---
+# --- 2. نماذج الذكاء الاصطناعي ---
 
 text_model = None
 vision_model = None
@@ -77,39 +51,37 @@ def clean_json_response(text):
     except ValueError:
         return None
 
-# --- 4. الواجهات البرمجية (API Endpoints) ---
+# --- 3. الواجهات البرمجية (API Endpoints) ---
 
 @app.route('/')
 def index():
-    """عرض ملف الواجهة الأمامية الرئيسي من المجلد المحدد"""
-    # تعديل هام: التأكد من أنه يخدم الملف من المجلد الصحيح
-    return send_from_directory(app.static_folder, 'index.html')
+    """عرض ملف الواجهة الأمامية الرئيسي"""
+    return send_from_directory('.', 'index.html')
 
 @app.route('/api/symptoms-search', methods=['POST'])
-def symptoms_search():
-    """API لتحليل الأعراض والموقع وإرجاع مقدمي الخدمة المناسبين"""
+def symptoms_search_api():
+    """
+    API لتحليل الأعراض وإرجاع التخصص الموصى به والنصيحة الأولية.
+    ملاحظة: عملية البحث والفلترة تتم الآن في الواجهة الأمامية (JavaScript).
+    """
     if not GEMINI_API_KEY:
         return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
 
     data = request.get_json()
-    if not data or 'symptoms' not in data or 'location' not in data:
+    if not data or 'symptoms' not in data:
         return jsonify({"error": "البيانات المرسلة غير كاملة."}), 400
 
     symptoms = data['symptoms']
-    location = data['location']
-
-    if NETWORK_DF.empty:
-        return jsonify({"error": "قاعدة بيانات الشبكة الطبية غير متاحة."}), 500
 
     try:
         prompt = f"""
         أنت مساعد طبي متخصص في توجيه المرضى. بناءً على الأعراض التالية: "{symptoms}"، قم بتحديد التخصص الطبي الأنسب.
-        يجب أن تختار تخصصًا واحدًا فقط من القائمة التالية: {json.dumps(UNIQUE_SPECIALTIES, ensure_ascii=False)}.
+        يجب أن تختار تخصصًا طبيًا شائعًا واحدًا فقط (مثل: باطنة, عظام, أطفال, جلدية, ...إلخ).
         وقدم نصيحة أولية قصيرة جداً (جملة واحدة) باللغة العربية.
 
         أريد الإجابة بصيغة JSON فقط، بالشكل التالي ولا شيء غيره:
         {{
-          "recommended_specialty": "التخصص المختار من القائمة",
+          "recommended_specialty": "التخصص المختار",
           "initial_advice": "نصيحة أولية موجزة."
         }}
         """
@@ -117,6 +89,7 @@ def symptoms_search():
         model = get_text_model()
         if not model:
             raise Exception("نموذج اللغة غير مهيأ.")
+            
         response = model.generate_content(prompt)
         
         cleaned_response_text = clean_json_response(response.text)
@@ -124,31 +97,8 @@ def symptoms_search():
              raise Exception("لم يتمكن النموذج من إرجاع JSON صالح.")
         
         ai_result = json.loads(cleaned_response_text)
-        recommended_specialty = ai_result.get("recommended_specialty", "")
-        initial_advice = ai_result.get("initial_advice", "")
-
-        location_df = NETWORK_DF[
-            NETWORK_DF['governorate'].str.contains(location, case=False, na=False) |
-            NETWORK_DF['address'].str.contains(location, case=False, na=False)
-        ]
-
-        best_match_df = location_df[
-            location_df['provider_type'].str.contains(recommended_specialty, case=False, na=False) |
-            location_df['specialty_sub'].str.contains(recommended_specialty, case=False, na=False)
-        ]
-
-        if not best_match_df.empty:
-            best_match = best_match_df.head(1).to_dict(orient='records')
-            other_results = best_match_df.iloc[1:].to_dict(orient='records')
-        else:
-            best_match = location_df.head(1).to_dict(orient='records')
-            other_results = location_df.iloc[1:].to_dict(orient='records')
-
-        return jsonify({
-            "initial_advice": initial_advice,
-            "best_match": best_match,
-            "other_results": other_results
-        })
+        
+        return jsonify(ai_result)
 
     except Exception as e:
         print(f"خطأ في API البحث بالأعراض: {e}")
@@ -156,7 +106,7 @@ def symptoms_search():
 
 
 @app.route('/api/analyze', methods=['POST'])
-def analyze_reports():
+def analyze_reports_api():
     """API لتحليل التقارير الطبية المرفوعة"""
     if not GEMINI_API_KEY:
         return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
@@ -198,6 +148,7 @@ def analyze_reports():
         model = get_vision_model()
         if not model:
             raise Exception("نموذج الرؤية غير مهيأ.")
+            
         response = model.generate_content(model_parts)
         
         cleaned_response_text = clean_json_response(response.text)
@@ -212,10 +163,7 @@ def analyze_reports():
         print(f"خطأ في API تحليل التقارير: {e}")
         return jsonify({"error": f"حدث خطأ أثناء تحليل التقرير: {e}"}), 500
 
-# --- 5. تشغيل التطبيق ---
-
-# تحميل البيانات عند بدء تشغيل Gunicorn
-load_network_data()
+# --- 4. تشغيل التطبيق ---
 
 if __name__ == '__main__':
     # هذا الجزء للتشغيل المحلي فقط
