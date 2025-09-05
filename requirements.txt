@@ -1,5 +1,6 @@
 Flask
-gunicorn
 flask-cors
-google-generativeai
 pandas
+openpyxl
+google-generativeai
+gunicorn
