@@ -9,12 +9,15 @@ from pathlib import Path
 
 # --- 1. الإعدادات الأولية ---
 
-# تهيئة تطبيق فلاسك
-app = Flask(__name__, static_folder='.', static_url_path='')
-CORS(app) # السماح بالطلبات من مصادر مختلفة (CORS)
+# تعديل هام: تحديد المجلد الذي يحتوي على ملفات الواجهة الأمامية (HTML, CSS, JS)
+# افترضت أن اسمه 'public'. إذا كان اسم المجلد مختلفًا، قم بتغييره هنا.
+STATIC_DIR = 'public'
+
+# تهيئة تطبيق فلاسك مع تحديد المجلد الصحيح
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='')
+CORS(app)
 
 # إعداد مفتاح Gemini API
-# هام: يجب تعيين متغير بيئة باسم "GEMINI_API_KEY" يحتوي على مفتاحك
 try:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
@@ -22,8 +25,6 @@ try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     print(f"خطأ في إعداد Gemini API: {e}")
-    # يمكنك إيقاف التطبيق هنا إذا كان المفتاح ضرورياً للتشغيل
-    # exit(1)
 
 # --- 2. تحميل ومعالجة البيانات ---
 
@@ -33,16 +34,15 @@ UNIQUE_SPECIALTIES = []
 def load_network_data():
     """تحميل بيانات الشبكة الطبية من ملف JSON إلى DataFrame عند بدء التشغيل"""
     global NETWORK_DF, UNIQUE_SPECIALTIES
-    json_path = Path("network_data.json")
+    # تأكد من أن المسار صحيح بالنسبة لمكان تشغيل Gunicorn
+    json_path = Path(__file__).parent / "network_data.json"
     if json_path.exists():
         try:
             print(f"[*] يتم تحميل بيانات الشبكة من {json_path}...")
             NETWORK_DF = pd.read_json(json_path)
-            # استخراج التخصصات الفريدة لاستخدامها في توجيه النموذج
             specialties = pd.concat([NETWORK_DF['provider_type'], NETWORK_DF['specialty_sub']]).dropna().unique()
             UNIQUE_SPECIALTIES = [s for s in specialties if s and "جميع" not in s]
             print(f"[✓] تم تحميل {len(NETWORK_DF)} سجل بنجاح.")
-            # print(f"[*] التخصصات المتاحة: {UNIQUE_SPECIALTIES}")
         except Exception as e:
             print(f"[!] خطأ أثناء تحميل أو معالجة {json_path}: {e}")
     else:
@@ -50,20 +50,18 @@ def load_network_data():
 
 # --- 3. نماذج الذكاء الاصطناعي ---
 
-# إعداد نماذج Gemini
-# ملاحظة: يتم تهيئة النماذج عند أول استخدام لتجنب الأخطاء إذا لم يتم توفير المفتاح
 text_model = None
 vision_model = None
 
 def get_text_model():
     global text_model
-    if text_model is None:
+    if text_model is None and GEMINI_API_KEY:
         text_model = genai.GenerativeModel('gemini-1.5-flash')
     return text_model
 
 def get_vision_model():
     global vision_model
-    if vision_model is None:
+    if vision_model is None and GEMINI_API_KEY:
         vision_model = genai.GenerativeModel('gemini-1.5-flash')
     return vision_model
     
@@ -72,7 +70,6 @@ def clean_json_response(text):
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
     if match:
         return match.group(1)
-    # إذا لم يجد النمط أعلاه، يبحث عن أول '{' وآخر '}'
     try:
         start = text.index('{')
         end = text.rindex('}') + 1
@@ -84,8 +81,9 @@ def clean_json_response(text):
 
 @app.route('/')
 def index():
-    """عرض ملف الواجهة الأمامية الرئيسي"""
-    return send_from_directory('.', 'index.html')
+    """عرض ملف الواجهة الأمامية الرئيسي من المجلد المحدد"""
+    # تعديل هام: التأكد من أنه يخدم الملف من المجلد الصحيح
+    return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/api/symptoms-search', methods=['POST'])
 def symptoms_search():
@@ -104,7 +102,6 @@ def symptoms_search():
         return jsonify({"error": "قاعدة بيانات الشبكة الطبية غير متاحة."}), 500
 
     try:
-        # بناء الطلب (Prompt) للنموذج
         prompt = f"""
         أنت مساعد طبي متخصص في توجيه المرضى. بناءً على الأعراض التالية: "{symptoms}"، قم بتحديد التخصص الطبي الأنسب.
         يجب أن تختار تخصصًا واحدًا فقط من القائمة التالية: {json.dumps(UNIQUE_SPECIALTIES, ensure_ascii=False)}.
@@ -118,9 +115,10 @@ def symptoms_search():
         """
         
         model = get_text_model()
+        if not model:
+            raise Exception("نموذج اللغة غير مهيأ.")
         response = model.generate_content(prompt)
         
-        # تنظيف وتحليل استجابة النموذج
         cleaned_response_text = clean_json_response(response.text)
         if not cleaned_response_text:
              raise Exception("لم يتمكن النموذج من إرجاع JSON صالح.")
@@ -129,25 +127,20 @@ def symptoms_search():
         recommended_specialty = ai_result.get("recommended_specialty", "")
         initial_advice = ai_result.get("initial_advice", "")
 
-        # البحث في DataFrame بناءً على توصية النموذج والموقع
-        # 1. فلترة حسب الموقع (بحث مرن)
         location_df = NETWORK_DF[
             NETWORK_DF['governorate'].str.contains(location, case=False, na=False) |
             NETWORK_DF['address'].str.contains(location, case=False, na=False)
         ]
 
-        # 2. فلترة حسب التخصص الموصى به
         best_match_df = location_df[
             location_df['provider_type'].str.contains(recommended_specialty, case=False, na=False) |
             location_df['specialty_sub'].str.contains(recommended_specialty, case=False, na=False)
         ]
 
-        # 3. تحديد أفضل نتيجة والباقي
         if not best_match_df.empty:
             best_match = best_match_df.head(1).to_dict(orient='records')
             other_results = best_match_df.iloc[1:].to_dict(orient='records')
         else:
-            # إذا لم يتم العثور على تطابق للتخصص، يتم إرجاع نتائج الموقع فقط
             best_match = location_df.head(1).to_dict(orient='records')
             other_results = location_df.iloc[1:].to_dict(orient='records')
 
@@ -174,8 +167,6 @@ def analyze_reports():
 
     try:
         model_parts = []
-        
-        # بناء الطلب (Prompt)
         prompt = f"""
         أنت مساعد طبي ذكي متخصص في تحليل التقارير الطبية. قم بتحليل الصور أو ملفات PDF المرفقة.
         مهمتك هي تقديم شرح مبسط، نصائح مؤقتة، والتخصص الموصى به.
@@ -195,21 +186,20 @@ def analyze_reports():
         """
         model_parts.append(prompt)
 
-        # معالجة الملفات المرفوعة
         for file_info in data['files']:
             mime_type = file_info.get('mime_type')
             base64_data = file_info.get('data')
             if mime_type and base64_data:
                 model_parts.append({'mime_type': mime_type, 'data': base64_data})
 
-        if len(model_parts) < 2: # يجب أن يكون هناك طلب + ملف واحد على الأقل
+        if len(model_parts) < 2:
              return jsonify({"error": "لم يتم إرسال أي ملفات صالحة للتحليل."}), 400
 
-        # إرسال الطلب إلى النموذج
         model = get_vision_model()
+        if not model:
+            raise Exception("نموذج الرؤية غير مهيأ.")
         response = model.generate_content(model_parts)
         
-        # تنظيف وتحليل الاستجابة
         cleaned_response_text = clean_json_response(response.text)
         if not cleaned_response_text:
             raise Exception("لم يتمكن النموذج من إرجاع JSON صالح.")
@@ -224,7 +214,9 @@ def analyze_reports():
 
 # --- 5. تشغيل التطبيق ---
 
+# تحميل البيانات عند بدء تشغيل Gunicorn
+load_network_data()
+
 if __name__ == '__main__':
-    load_network_data() # تحميل البيانات عند بدء التشغيل
-    # عند التشغيل المحلي، استخدم المنفذ 5000
+    # هذا الجزء للتشغيل المحلي فقط
     app.run(debug=True, port=5000)
