@@ -1,150 +1,120 @@
-import os
-import google.generativeai as genai
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-import json
-import base64
-import pandas as pd # <-- تم استيراد مكتبة باندا للتعامل مع الملفات
+# make_network_zip.py
+# usage:
+#   python make_network_zip.py "network_data (1).xlsx"
 
-# This app is designed to serve a static index.html file and provide AI-powered APIs.
-# It will serve the main page from the 'static' folder.
-app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app)
+import sys, os, json, zipfile, hashlib
+from typing import List
+import pandas as pd
 
-# --- تحميل بيانات الشبكة الطبية من ملف CSV ---
-# يتم تحميل البيانات مرة واحدة عند بدء تشغيل التطبيق لتحسين الأداء
-try:
-    # تأكد من أن اسم الملف مطابق للملف الذي لديك
-    network_df = pd.read_csv('network_data.csv')
-    # تحويل البيانات إلى صيغة JSON لتكون جاهزة للإرسال
-    NETWORK_DATA_JSON = network_df.to_dict(orient='records')
-    print("تم تحميل بيانات الشبكة الطبية بنجاح.")
-except FileNotFoundError:
-    print("خطأ: لم يتم العثور على ملف 'network_data.csv'. سيتم استخدام بيانات فارغة.")
-    NETWORK_DATA_JSON = []
-except Exception as e:
-    print(f"حدث خطأ أثناء قراءة ملف CSV: {e}")
-    NETWORK_DATA_JSON = []
-# -------------------------------------------------
+def clean_phone(val: object) -> str:
+    s = str(val).strip()
+    if s.lower() in ("nan", "none", "null"):
+        return ""
+    if s.endswith(".0"):  # أرقام اتقريت float من الإكسل
+        s = s[:-2]
+    return s
 
+def main(xlsx_path: str):
+    if not os.path.exists(xlsx_path):
+        print(f"[!] Excel not found: {xlsx_path}")
+        sys.exit(1)
 
-# This is a dynamic list of specialties that the AI model can recommend.
-# In a real-world scenario, this would be populated from a database.
-# For now, it's a comprehensive list based on the provided medical network data.
-AVAILABLE_SPECIALTIES = """
-"باطنة", "علاج طبيعي", "اسنان", "صيدلية", "قلب واوعية دموية", "جراحة مخ وأعصاب", 
-"معمل", "أشعة", "نساء وتوليد", "اطفال", "عظام", "جلدية", "انف واذن وحنجرة", 
-"عيون", "صدرية", "جراحة عامة", "مسالك بولية", "مستشفى", "مركز طبي", "بصريات"
-"""
+    # قراءة الشيت
+    xlsx = pd.ExcelFile(xlsx_path)
+    sheet_name = "network_data" if "network_data" in xlsx.sheet_names else xlsx.sheet_names[0]
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=0)
+    df.columns = [str(c).strip() for c in df.columns]
 
-@app.route('/')
-def serve_index():
-    """Serves the main index.html file."""
-    # To deploy, you should create a 'static' folder and place the final index.html file inside it.
-    return send_from_directory('static', 'index.html')
+    # تحديد أعمدة مطلوبة (أسماء عربية كما في الملف)
+    name_col = "اسم مقدم الخدمة" if "اسم مقدم الخدمة" in df.columns else ("مقدم الخدمة" if "مقدم الخدمة" in df.columns else None)
+    if name_col is None:
+        print("[!] لم يتم العثور على عمود الاسم (اسم مقدم الخدمة/مقدم الخدمة).")
+        sys.exit(1)
 
-# --- نقطة وصول جديدة لجلب بيانات الشبكة ---
-@app.route('/api/network-data', methods=['GET'])
-def get_network_data():
-    """
-    هذه هي نقطة النهاية الجديدة التي ترسل بيانات الشبكة
-    الموجودة في ملف CSV إلى الواجهة الأمامية.
-    """
-    return jsonify(NETWORK_DATA_JSON)
-# -----------------------------------------
+    required_source_cols = {
+        "المنطقة": "governorate",
+        "التخصص الرئيسي": "provider_type",
+        "التخصص الفرعي": "specialty_sub",
+        name_col: "name",
+        "عنوان مقدم الخدمة": "address",
+    }
 
+    # تأكد من وجود الأعمدة، لو ناقص أنشئ عمود فاضي
+    for col in list(required_source_cols.keys()) + ["Telephone1","Telephone2","Telephone3","Telephone4","Hotline"]:
+        if col not in df.columns:
+            df[col] = ""
 
-@app.route("/api/recommend", methods=["POST"])
-def recommend_specialty():
-    """
-    Analyzes patient symptoms and recommends the most suitable medical specialty.
-    This functionality remains unchanged.
-    """
-    data = request.get_json()
-    symptoms = data.get("symptoms", "")
-    
-    if not symptoms:
-        return jsonify({"error": "الرجاء إدخال الأعراض."}), 400
-        
-    try:
-        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = genai.GenerativeModel('gemini-pro')
-        
-        prompt = f"""
-        بصفتك مساعدًا طبيًا ذكيًا، قم بتحليل الأعراض التالية واقترح التخصص الطبي الأنسب من القائمة المتاحة فقط.
-        الأعراض: \"{symptoms}\"
-        قائمة التخصصات المتاحة: [{AVAILABLE_SPECIALTIES}]
+    # تخلّص من الصفوف الفارغة
+    df = df.dropna(how="all")
 
-        المطلوب منك تقديم رد بصيغة JSON فقط، بدون أي علامات، يحتوي على الحقول التالية:
-        1. `id`: (String) اسم التخصص الطبي **المناسب فقط** من القائمة.
-        2. `reason`: (String) شرح مبسط باللغة العربية لسبب اختيار هذا التخصص بناءً على الأعراض.
+    # احتفظ فقط بالصفوف التي تحتوي منطقة واسم
+    df = df[(df["المنطقة"].astype(str).str.strip() != "") & (df[name_col].astype(str).str.strip() != "")]
 
-        **هام:** اختر تخصصًا واحدًا فقط. إذا كانت الأعراض غير واضحة، اختر "باطنة" كإجراء احتياطي.
-        """
-        response = model.generate_content(prompt)
-        
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
-        json_response = json.loads(cleaned_text)
-        return jsonify(json_response)
-        
-    except json.JSONDecodeError:
-        print(f"ERROR in /api/recommend: JSONDecodeError. Response text: {response.text}")
-        return jsonify({"error": "فشل المساعد الذكي في تكوين رد صالح."}), 500
-    except Exception as e:
-        print(f"ERROR in /api/recommend: {str(e)}")
-        return jsonify({"error": "حدث خطأ غير متوقع."}), 500
+    records = []
+    for idx, row in df.iterrows():
+        phones: List[str] = []
+        for c in ["Telephone1","Telephone2","Telephone3","Telephone4"]:
+            p = clean_phone(row.get(c, ""))
+            if p not in ("", "0"):
+                phones.append(p)
 
-@app.route("/api/analyze", methods=["POST"])
-def analyze_reports():
-    """
-    Analyzes uploaded medical reports.
-    This functionality remains unchanged.
-    """
-    try:
-        user_notes = request.form.get("user_notes", "")
-        files = request.files.getlist("files")
+        hotline = clean_phone(row.get("Hotline", ""))
+        hotline = hotline if hotline not in ("", "0") else None
 
-        if not files:
-            return jsonify({"error": "يرجى رفع ملف واحد على الأقل."}), 400
+        rec = {
+            "governorate": str(row.get("المنطقة", "")).strip(),
+            "provider_type": str(row.get("التخصص الرئيسي", "")).strip(),
+            "specialty_sub": str(row.get("التخصص الفرعي", "")).strip(),
+            "name": str(row.get(name_col, "")).strip(),
+            "address": str(row.get("عنوان مقدم الخدمة", "")).strip(),
+            "phones": phones,
+            "hotline": hotline,
+            "id": f"row-{idx}",
+        }
+        records.append(rec)
 
-        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = genai.GenerativeModel('gemini-1.5-flash')
+    # مسارات الإخراج
+    out_json = "network_data.json"
+    out_json_min = "network_data.min.json"
+    out_csv = "network_data.csv"
+    out_zip = "network_data_all.zip"
 
-        file_parts = []
-        for file in files:
-            file_bytes = file.read()
-            base64_encoded = base64.b64encode(file_bytes).decode('utf-8')
-            file_parts.append({
-                "mime_type": file.mimetype,
-                "data": base64_encoded
-            })
-        
-        prompt = f"""
-        بصفتك مساعدًا طبيًا متخصصًا، قم بتحليل التقارير الطبية المرفقة.
-        قائمة التخصصات المتاحة للاقتراح: [{AVAILABLE_SPECIALTIES}]
-        ملاحظات المريض الإضافية: \"{user_notes if user_notes else 'لا يوجد'}\"
+    # JSON منسّق
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
 
-        المطلوب منك تحليل الملفات وتقديم رد بصيغة JSON فقط، بدون أي علامات، يحتوي على الحقول التالية:
-        1.  `interpretation`: (String) شرح احترافي ومبسط لما يظهر في التقرير. ركز على المؤشرات غير الطبيعية. **لا تقدم تشخيصاً نهائياً أبداً وأكد أن هذه ملاحظات أولية.**
-        2.  `temporary_advice`: (Array of strings) قائمة من 3 نصائح عامة ومؤقتة.
-        3.  `recommendations`: (Array of objects) قائمة تحتوي على **تخصص واحد فقط** هو الأنسب للحالة، وتحتوي على `id` و `reason`.
+    # JSON مضغوط (minified)
+    with open(out_json_min, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, separators=(",", ":"))
 
-        **هام:** إذا كانت الملفات غير واضحة، أعد رداً مناسباً في حقل `interpretation` واترك الحقول الأخرى فارغة.
-        """
-        
-        content = [prompt] + file_parts
-        response = model.generate_content(content)
-        
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
-        json_response = json.loads(cleaned_text)
-        return jsonify(json_response)
+    # CSV (phones كقائمة مفصولة بفواصل منقوطة)
+    df_out = pd.DataFrame(records)
+    df_out["phones"] = df_out["phones"].apply(lambda lst: ";".join(lst) if isinstance(lst, list) else "")
+    df_out.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    except json.JSONDecodeError:
-        print(f"ERROR in /api/analyze: JSONDecodeError. Response text: {response.text}")
-        return jsonify({"error": "فشل المساعد الذكي في تكوين رد صالح."}), 500
-    except Exception as e:
-        print(f"ERROR in /api/analyze: {str(e)}")
-        return jsonify({"error": f"حدث خطأ غير متوقع: {str(e)}"}), 500
+    # ZIP
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(out_json, arcname=os.path.basename(out_json))
+        z.write(out_json_min, arcname=os.path.basename(out_json_min))
+        z.write(out_csv, arcname=os.path.basename(out_csv))
+
+    # شوية معلومات للطباعة
+    def md5sum(path):
+        m = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                m.update(chunk)
+        return m.hexdigest()
+
+    print("\n[✓] Conversion complete")
+    print(f"  Records: {len(records)}")
+    print(f"  JSON: {out_json}   ({os.path.getsize(out_json)} bytes)   md5={md5sum(out_json)}")
+    print(f"  JSON(min): {out_json_min}   ({os.path.getsize(out_json_min)} bytes)   md5={md5sum(out_json_min)}")
+    print(f"  CSV:  {out_csv}   ({os.path.getsize(out_csv)} bytes)   md5={md5sum(out_csv)}")
+    print(f"  ZIP:  {out_zip}   ({os.path.getsize(out_zip)} bytes)   md5={md5sum(out_zip)}")
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    if len(sys.argv) < 2:
+        print("Usage: python make_network_zip.py \"network_data (1).xlsx\"")
+        sys.exit(1)
+    main(sys.argv[1])
