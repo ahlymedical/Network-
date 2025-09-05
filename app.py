@@ -8,8 +8,7 @@ from pathlib import Path
 
 # --- 1. الإعدادات الأولية ---
 
-# تعديل أساسي: تحديد المجلد الحالي كمصدر للملفات الثابتة
-# هذا يتوافق مع وجود index.html في المجلد الرئيسي
+# يخدم الملفات من المجلد الرئيسي حيث يوجد index.html
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
@@ -60,9 +59,6 @@ def index():
 
 @app.route('/api/symptoms-search', methods=['POST'])
 def symptoms_search_api():
-    """
-    API لتحليل الأعراض وإرجاع التخصص الموصى به والنصيحة الأولية.
-    """
     if not GEMINI_API_KEY:
         return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
 
@@ -106,7 +102,6 @@ def symptoms_search_api():
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_reports_api():
-    """API لتحليل التقارير الطبية المرفوعة"""
     if not GEMINI_API_KEY:
         return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
         
@@ -165,5 +160,4 @@ def analyze_reports_api():
 # --- 4. تشغيل التطبيق ---
 
 if __name__ == '__main__':
-    # هذا الجزء للتشغيل المحلي فقط
     app.run(debug=True, port=5000)
