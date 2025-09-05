@@ -8,12 +8,12 @@ from pathlib import Path
 
 # --- 1. الإعدادات الأولية ---
 
-# تهيئة تطبيق فلاسك ليخدم الملفات من المجلد الحالي
+# تعديل أساسي: تحديد المجلد الحالي كمصدر للملفات الثابتة
+# هذا يتوافق مع وجود index.html في المجلد الرئيسي
 app = Flask(__name__, static_folder='.', static_url_path='')
-CORS(app) # السماح بالطلبات من مصادر مختلفة (CORS)
+CORS(app)
 
 # إعداد مفتاح Gemini API
-# هام: يجب تعيين متغير بيئة باسم "GEMINI_API_KEY" يحتوي على مفتاحك
 try:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
@@ -62,7 +62,6 @@ def index():
 def symptoms_search_api():
     """
     API لتحليل الأعراض وإرجاع التخصص الموصى به والنصيحة الأولية.
-    ملاحظة: عملية البحث والفلترة تتم الآن في الواجهة الأمامية (JavaScript).
     """
     if not GEMINI_API_KEY:
         return jsonify({"error": "خدمة المساعد الذكي غير متاحة حالياً."}), 503
